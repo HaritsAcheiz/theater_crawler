@@ -1,0 +1,10 @@
+.python-version
+pyproject.toml
+.venv/
+uv.lock
+.env
+*.bak
+*.html
+*.json
+*.db
+*.txt
