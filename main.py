@@ -7,6 +7,7 @@ import logging
 from dotenv import load_dotenv
 import os
 from dataclasses import dataclass
+import time
 from urllib.parse import urljoin
 import sqlite3
 from pathlib import Path
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Scraper:
     base_url: str = "https://www.fandango.com/"
-    movietimes_api: str = "https://www.fandango.com/napi/theaterMovieShowtimes/"
+    showtimes_api: str = "https://www.fandango.com/napi/theaterMovieShowtimes/"
     seat_api: str = "https://tickets.fandango.com/checkoutapi/showtimes/v2/"
 
 
@@ -103,11 +104,25 @@ class Scraper:
             cursor = conn.cursor()
 
             # Mapping for table schemas
+            # showtimes = ['viewModel']['movies'][i]['variants'][j]['amenityGroups'][k]['showtimes'][l]:
+            # showtime_id = ['id']
+            # ticketingDate = ['ticketingDate']
+            # url = ['ticketingJumpPageURL']
+
+            # ['viewModel']['movies'][i]:
+            # mid = ['id']
+            # movie_name = ['title']
+            # runtime = ['runtime']
+            # release_date = ['releaseDate']
+            # rating = ['rating']
+            # poster_url = ['poster']['size']['full']
+            # genres = ['genres'][index]
+
             schemas = {
                 'cities': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, source TEXT, name TEXT, url TEXT)",
                 'theaters': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, source TEXT, city_code TEXT, name TEXT, theater_id TEXT, url TEXT)",
-                'movietimes': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, source TEXT, theater_code TEXT, date_part date, time_part time, name TEXT, movie_id TEXT, theater_id TEXT, rating TEXT, url TEXT)",
-                'seats': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, movietimes_code TEXT, name TEXT, url TEXT)"
+                'showtimes': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, source TEXT, theater_code TEXT, theater_id TEXT, ticketing_date TEXT, movie_id TEXT, movie_title TEXT, runtime INT, release_date TEXT, rating TEXT, poster_url TEXT, genres TEXT, showtime_id TEXT, url TEXT)",
+                'seats': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, showtimes_code TEXT, name TEXT, url TEXT)"
             }
             
             cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} {schemas[table_name]}")
@@ -117,7 +132,7 @@ class Scraper:
             columns = {
                 'cities': "code, source, name, url",
                 'theaters': "code, source, city_code, name, theater_id, url",
-                'movietimes': "code, source, theater_code, date_part, time_part, name, movie_id, theater_id, rating, url",
+                'showtimes': "code, source, theater_code, theater_id, ticketing_date, movie_id, movie_title, runtime, release_date, rating, poster_url, genres, showtime_id, url",
                 'seats': "name, url" # Note: your original logic for seats had only 2 columns in VALUES
             }
             
@@ -130,141 +145,98 @@ class Scraper:
             logger.error(f"Database Error on {table_name}: {e}")
             raise
     
-    async def fetch_pages(self, targets, mode='theaters', cookie_header=None, cookie_url=None, headers_template=None):
-        # prefer the configure API to set defaults (avoids deprecation warnings)
+    async def fetch_pages(self, targets, mode='theaters'):
+        """Fetch multiple pages asynchronously."""
+        # Configure parser settings if needed (not browser settings)
         try:
-            AsyncFetcher.configure(adaptive=True, stealthy_headers=True, follow_redirects=True, timeout=60000)
+            AsyncFetcher.configure(adaptive=True)
         except Exception:
-            logger.debug("AsyncFetcher.configure not available; proceeding to instantiate fetcher with defaults")
-
-        fetcher = AsyncFetcher()
+            logger.debug("AsyncFetcher.configure not available")
         
         logger.info(f"Starting async fetch for {len(targets)} pages...")
         
         try:
-            # Build urls and a parallel references list so each response can be mapped
-            # back to its originating target (e.g. theater_code). urls_len may differ
-            # from len(targets) when mode='movietimes' because we generate multiple
-            # dates per theater.
             urls = []
             references = []
-
+            
             if mode == 'theaters':
                 for target in targets:
                     urls.append(target[-1])
-                    # use index 1 as the canonical code (matches your DB schema)
                     references.append(target[1])
-
-            elif mode == 'movietimes':
+                    
+            elif mode == 'showtimes':
                 current_date = datetime.now()
                 for target in targets:
                     theater_code = target[1]
                     theater_id = target[5]
                     for i in range(7):
                         date = current_date + timedelta(days=i)
-                        urls.append(urljoin(self.movietimes_api, f"{theater_id}?startDate={date.strftime('%Y-%m-%d')}&isdesktop=true&partnerRestrictedTicketing="))
-                        # repeat the theater_code for each generated URL
-                        references.append(theater_code)
-
-            else:
-                raise ValueError(f"Unknown mode specified for fetch_pages: {mode}")
-
-            # If requested, build a cookie header from a URL (quick requests-based
-            # session) when cookie_header isn't provided directly. If not provided
-            # and we're in movietimes mode, attempt to capture cookies via a
-            # headless browser using a representative theater page from targets.
-            if cookie_header is None:
-                if cookie_url:
-                    try:
-                        cookie_header = self.build_cookie_header(cookie_url)
-                    except Exception:
-                        logger.exception("Failed to build cookie header from %s", cookie_url)
-                elif mode == 'movietimes' and targets:
-                    # attempt to capture cookies using DynamicFetcher on a theater page
-                    try:
-                        # targets entries are rows where the last element is the theater URL
-                        representative_url = targets[0][-1]
-                        logger.info("No cookie header provided; capturing cookies via DynamicFetcher from %s", representative_url)
-                        # capture_cookies_via_dynamic uses Playwright's sync API; run it in a thread
-                        cookie_header, cookies_list, set_cookie_headers, captured_requests = await asyncio.to_thread(
-                            self.capture_cookies_via_dynamic, representative_url
+                        url = urljoin(
+                            self.showtimes_api, 
+                            f"{theater_id}?startDate={date.strftime('%Y-%m-%d')}&isdesktop=true&partnerRestrictedTicketing="
                         )
-                        if not cookie_header:
-                            logger.warning("Dynamic cookie capture returned no cookie header; movietimes requests may still be blocked")
-                    except Exception:
-                        logger.exception("Failed to capture cookies via DynamicFetcher for movietimes")
-
+                        urls.append(url)
+                        references.append(theater_code)
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
+            
+            # Capture cookies for showtimes mode
+            cookie_header = None
+            if mode == 'showtimes' and targets:
+                try:
+                    representative_url = targets[0][-1]
+                    logger.info(f"Capturing cookies from {representative_url}")
+                    
+                    cookie_header, cookies_dict = await asyncio.to_thread(
+                        self.capture_cookies_via_dynamic, 
+                        representative_url
+                    )
+                    
+                    if not cookie_header:
+                        logger.warning("No cookies captured; requests may be blocked")
+                except Exception:
+                    logger.exception("Failed to capture cookies")
+            
+            # Actually fetch the pages
+            # headers = {}
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0',
+                'Accept': '*/*',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': 'https://www.fandango.com/'
+            }
+            if cookie_header:
+                headers['Cookie'] = cookie_header
+            
+            # Fetch all URLs concurrently
             tasks = []
-            # If we captured a representative NAPI request, use its headers as a template
-            # `headers_template` parameter (explicit) takes precedence over captured template
-            replay_headers_template = None
-            try:
-                if 'captured_requests' in locals() and captured_requests:
-                    # pick first captured request that looks like the movietimes API
-                    for r in captured_requests:
-                        u = r.get('url') if isinstance(r, dict) else None
-                        if u and 'napi/theaterMovieShowtimes' in u:
-                            replay_headers_template = r.get('request_headers') or r.get('headers')
-                            if replay_headers_template:
-                                # normalize keys to str
-                                replay_headers_template = dict(replay_headers_template)
-                                break
-            except Exception:
-                logger.debug("Could not build replay headers template from captured requests")
-
             for url in urls:
-                # Try per-request headers first; if AsyncFetcher.get doesn't accept
-                # headers, fall back to setting fetcher.headers (best-effort).
-                # Start from explicit headers_template (highest priority), otherwise
-                # fall back to captured replay_headers_template if present.
-                headers = None
-                if headers_template:
-                    headers = dict(headers_template)
-                elif replay_headers_template:
-                    headers = dict(replay_headers_template)
-
-                # Always include cookie_header if available
-                if cookie_header:
-                    if headers is None:
-                        headers = {"Cookie": cookie_header}
-                    else:
-                        headers.update({"Cookie": cookie_header})
-
-                if headers:
-                    try:
-                        task = fetcher.get(url, headers=headers)
-                    except TypeError:
-                        # method signature likely doesn't accept headers
-                        try:
-                            if hasattr(fetcher, 'headers') and isinstance(fetcher.headers, dict):
-                                fetcher.headers.update(headers)
-                        except Exception:
-                            logger.debug("Could not set fetcher.headers; proceeding without per-request cookies/headers")
-                        task = fetcher.get(url)
-                else:
-                    task = fetcher.get(url)
+                # Pass fetcher options directly to get() method
+                task = AsyncFetcher.get(
+                    url,
+                    stealthy_headers=True,
+                    follow_redirects=True,
+                    timeout=60000,
+                    headers=headers if headers else None
+                )
                 tasks.append(task)
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-
+            
+            pages = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Combine pages with their references
             results = []
-            success_count = 0
-            for i, response in enumerate(responses):
-                # Map response at index i back to the reference at index i
-                ref = references[i] if i < len(references) else None
-
-                if isinstance(response, Exception):
-                    logger.warning(f"Request failed for {urls[i]} (ref={ref}): {response}")
-                    continue
-
-                success_count += 1
-                results.append((ref, response))
-
-            logger.info(f"Fetch complete. Success: {success_count}/{len(urls)} requests")
+            for page, ref in zip(pages, references):
+                if isinstance(page, Exception):
+                    logger.error(f"Failed to fetch page for {ref}: {page}")
+                    results.append((ref, None))
+                else:
+                    results.append((ref, page))
+            
             return results
-
-        except Exception as e:
-            logger.exception(f"Critical error in fetch_pages: {e}")
-            raise
+            
+        except Exception:
+            logger.exception("fetch_pages failed")
+            return []
 
     def fetch_page(self, url):
         fetcher = Fetcher()
@@ -329,48 +301,142 @@ class Scraper:
             logger.error(f"Error in get_theaters: {e}")
             raise
     
-    def get_movietimes(self, page_contents):
+    def get_showtimes(self, page_contents):
+        """Parse movie showtimes from API responses."""
         try:
-            movietimes = []
-
-            print(page_contents[0][1])
+            showtimes = []
+            
             for theater_code, response in page_contents:
                 if response is None or isinstance(response, Exception):
+                    logger.warning(f"No data for theater_code: {theater_code}")
                     continue
                 
-
-                selector = response if hasattr(response, "css") else Selector(response.body)
-                showtime_elements = selector.css("li.shared-movie-showtimes")
-                # print(len(showtime_elements))
-
-                if not showtime_elements:
-                    logger.debug(f"No showtimes found for theater_code: {theater_code}")
+                try:
+                    # Use Scrapling to extract JSON from body tag
+                    selector = response if hasattr(response, "css") else Selector(response.text)
+                    body_element = selector.css("body").get()
+                    
+                    if not body_element:
+                        logger.warning(f"Could not find body element for theater_code: {theater_code}")
+                        continue
+                    
+                    # Get text content from body
+                    json_str = body_element.text.strip()
+                    json_data = json.loads(json_str)
+                    
+                    # Navigate the JSON structure
+                    view_model = json_data.get('viewModel', {})
+                    theater_info = view_model.get('theater', {})
+                    theater_id = theater_info.get('id', '')
+                    
+                    # Get movies list
+                    movies = view_model.get('movies', [])
+                    
+                    if not movies:
+                        logger.debug(f"No movies found for theater_code: {theater_code}")
+                        continue
+                    
+                    for movie in movies:
+                        # Extract movie details
+                        movie_id = movie.get('id', '')
+                        movie_title = movie.get('title', '').strip()
+                        runtime = movie.get('runtime', 0)  # in minutes
+                        release_date = movie.get('releaseDate', '')
+                        rating = movie.get('rating', '')
+                        
+                        # Extract poster URL from nested structure
+                        poster_data = movie.get('poster', {})
+                        poster_size = poster_data.get('size', {})
+                        poster_url = poster_size.get('full', '')
+                        
+                        # Extract genres (usually a list)
+                        genres_list = movie.get('genres', [])
+                        genres = ','.join(genres_list) if isinstance(genres_list, list) else str(genres_list)
+                        
+                        # Get variants (format variations like IMAX, 3D, etc.)
+                        variants = movie.get('variants', [])
+                        
+                        if not variants:
+                            logger.debug(f"No variants found for movie {movie_id} in theater {theater_code}")
+                            continue
+                        
+                        for variant in variants:
+                            # Get amenity groups (different screening types)
+                            amenity_groups = variant.get('amenityGroups', [])
+                            
+                            if not amenity_groups:
+                                logger.debug(f"No amenity groups for movie {movie_id}")
+                                continue
+                            
+                            for amenity_group in amenity_groups:
+                                # Get showtimes for this amenity group
+                                showtimes_data = amenity_group.get('showtimes', [])
+                                
+                                if not showtimes_data:
+                                    # Record movie without showtimes
+                                    code = hashlib.md5(f"{theater_code}_{movie_id}".encode()).hexdigest()
+                                    showtimes.append((
+                                        code,
+                                        'fandango',  # source
+                                        theater_code,
+                                        theater_id,
+                                        None,  # ticketing_date
+                                        movie_id,
+                                        movie_title,
+                                        runtime,
+                                        release_date,
+                                        rating,
+                                        poster_url,
+                                        genres,
+                                        None,  # showtime_id
+                                        None   # url
+                                    ))
+                                    continue
+                                
+                                for showtime in showtimes_data:
+                                    showtime_id = showtime.get('id', '')
+                                    ticketing_date = showtime.get('ticketingDate', '')
+                                    ticketing_url = showtime.get('ticketingJumpPageURL', '')
+                                    
+                                    # Create unique code for this showtime
+                                    code = hashlib.md5(
+                                        f"{theater_code}_{movie_id}_{showtime_id}".encode()
+                                    ).hexdigest()
+                                    
+                                    # Build full URL if relative
+                                    url = urljoin(self.base_url, ticketing_url) if ticketing_url else None
+                                    
+                                    showtimes.append((
+                                        code,
+                                        'fandango',
+                                        theater_code,
+                                        theater_id,
+                                        ticketing_date,
+                                        movie_id,
+                                        movie_title,
+                                        runtime,
+                                        release_date,
+                                        rating,
+                                        poster_url,
+                                        genres,
+                                        showtime_id,
+                                        url
+                                    ))
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error for theater_code {theater_code}: {e}")
                     continue
-
-                for showtime in showtime_elements:
-                    name_elem = showtime.css_first("a.shared-movie-showtimes__movie-title-link")
-                    rating_elem = showtime.css_first("data.shared-showtimes__movie-rating")
-                    schedule_elems = showtime.css("showtimes-btn-list__item > a")
-                    for sched in schedule_elems:
-                        code = hashlib.md5(url.encode()).hexdigest()
-                        source = response.url
-                        url = sched.attrib.get("href", "")
-                        # url = 'https://tickets.fandango.com/transaction/ticketing/mobile/jump.aspx?sdate=2026-01-21%2B12%3A00&from=mov_det_showtimes&source=desktop&mid=2040&tid=AAYAH&dfam=webbrowser&showtimehashcode=v2-e8be2d0ea039ad92bcc49cd16144d2dd968ba5d87205ad2fefd848870637d4dc'
-                        sdate = url.split("sdate=")[-1].split("&")[0]
-                        date_part = sdate.split("+")[0]
-                        time_part = sdate.split("+")[-1].replace("%3A", ":")
-                        movie_id = url.split("mid=")[-1].split("&")[0]
-                        theater_id = url.split("tid=")[-1].split("&")[0]
-                        name = name_elem.text.strip() if name_elem else ""
-                        rating = rating_elem.attrib.get("value", "") if rating_elem else ""
-                        movietimes.append((code, source, theater_code, date_part, time_part, name, movie_id, theater_id, rating, url))
-
-            logger.info(f"Parsed {len(movietimes)} total movietimes from all pages.")
-            if movietimes:
-                self.save_to_db(movietimes, table_name="movietimes")
+                except Exception as e:
+                    logger.error(f"Error parsing theater_code {theater_code}: {e}")
+                    continue
             
+            logger.info(f"Parsed {len(showtimes)} total showtimes from all pages.")
+            
+            if showtimes:
+                self.save_to_db(showtimes, table_name="showtimes")
+                
         except Exception as e:
-            logger.error(f"Error in get_movietimes: {e}")
+            logger.error(f"Error in get_showtimes: {e}")
             raise
 
     def fetch_seat_map(self, showtime_id, movie_id=243965, chainCode='REGL', sdate='2026-01-21+19%3A05', theater_id='AAODH', timeout=60000, save_file=None):
@@ -428,148 +494,66 @@ class Scraper:
         return result
 
     def capture_cookies_via_dynamic(self, theater_url, timeout=60000):
-        """Use DynamicFetcher (Playwright) to open the theater page and capture cookies.
-
-        Returns a tuple (cookie_header, cookies_list, captured_set_cookie_headers)
-        - cookie_header: str like 'k1=v1; k2=v2' suitable for passing as Cookie header
-        - cookies_list: list of cookie dicts from the browser context if available
-        - captured_set_cookie_headers: list of Set-Cookie header strings observed during the load
-        """
-        captured_set_cookie = []
-        captured_requests = []
-
-        def _on_response(resp):
-            try:
-                # robustly get headers (some wrappers expose as dict, some as callable)
-                headers = None
-                try:
-                    hdrs = getattr(resp, 'headers', None)
-                    headers = hdrs() if callable(hdrs) else hdrs
-                except Exception:
-                    headers = None
-
-                if not headers:
-                    headers = getattr(resp, 'response_headers', None) or {}
-
-                # normalize keys to check for set-cookie
-                if headers:
-                    for k, v in list(headers.items()):
-                        if k.lower() == 'set-cookie' and v:
-                            captured_set_cookie.append(v)
-                            break
-
-                # record request/response url and status for debugging
-                # attempt to capture request headers/body for NAPI endpoints
-                req_info = {'url': getattr(resp, 'url', None), 'status': getattr(resp, 'status', None)}
-                try:
-                    # try common attributes for request object on the response
-                    req_obj = getattr(resp, 'request', None) or getattr(resp, '_request', None) or getattr(resp, '_playwright_request', None)
-                    if req_obj:
-                        # headers may be callable or dict-like
-                        rheaders = None
-                        try:
-                            hdrs = getattr(req_obj, 'headers', None)
-                            rheaders = hdrs() if callable(hdrs) else hdrs
-                        except Exception:
-                            rheaders = None
-
-                        if not rheaders:
-                            # some wrappers expose request.headers as dict directly
-                            rheaders = getattr(req_obj, 'request_headers', None) or getattr(req_obj, 'headers', None)
-
-                        req_info['request_headers'] = dict(rheaders) if isinstance(rheaders, dict) else rheaders
-
-                        # try to get post data / body
-                        post_data = None
-                        try:
-                            pd = getattr(req_obj, 'post_data', None)
-                            post_data = pd() if callable(pd) else pd
-                        except Exception:
-                            post_data = None
-                        req_info['request_post_data'] = post_data
-                except Exception:
-                    logger.debug("Failed to extract request object from response wrapper")
-
-                captured_requests.append(req_info)
-            except Exception:
-                logger.exception("Error in capture response callback")
-
-        # use the recommended configure API to avoid deprecation behavior
+        """Capture cookies using DynamicFetcher."""
         try:
-            DynamicFetcher.configure(headless=True, network_idle=True, timeout=timeout)
-        except Exception:
-            # ignore if configure not available or fails; continue with defaults
-            logger.debug("DynamicFetcher.configure not available or failed; proceeding with defaults")
-
-        fetcher = DynamicFetcher()
-
-        try:
-            # Load the page; this will trigger network requests and our callback
-            fetcher.fetch(url=theater_url, on_response=_on_response)
-
-            # Try multiple ways to read cookies from the wrapper/browser context
-            cookies_list = []
-            try:
-                # 1) common scrapling wrapper: fetcher.context().cookies()
-                if hasattr(fetcher, 'context') and callable(getattr(fetcher, 'context')):
-                    try:
-                        cookies_list = fetcher.context().cookies()
-                    except Exception:
-                        # maybe context() returns an object with cookies() method
-                        ctx = fetcher.context()
-                        if hasattr(ctx, 'cookies') and callable(getattr(ctx, 'cookies')):
-                            cookies_list = ctx.cookies()
-
-                # 2) fetcher.page.context.cookies()
-                if not cookies_list and hasattr(fetcher, 'page'):
-                    page = fetcher.page
-                    if hasattr(page, 'context') and callable(getattr(page.context, 'cookies', None)):
-                        cookies_list = page.context.cookies()
-
-                # 3) some wrappers expose cookies property directly
-                if not cookies_list and hasattr(fetcher, 'cookies'):
-                    try:
-                        c = fetcher.cookies
-                        if callable(c):
-                            cookies_list = c()
-                        else:
-                            cookies_list = c
-                    except Exception:
-                        pass
-            except Exception:
-                logger.debug("Could not read browser context cookies via wrapper; falling back to Set-Cookie headers")
-
-            # Build cookie header from cookies_list or from captured Set-Cookie headers
+            # Fetch the page
+            page = DynamicFetcher.fetch(
+                url=theater_url,
+                headless=True,
+                network_idle=True,
+                timeout=timeout
+            )
+            
+            # page.cookies returns a tuple/list of cookie dicts
+            cookies_list = page.cookies if page.cookies else []
+            
+            logger.info(f"Captured {len(cookies_list)} total cookies")
+            
+            # Filter to essential cookies
+            essential_patterns = [
+                'akamai_location', 'akamai_generated_location',
+                'searchcity', 'searchstate', 'searchlocation',
+                'pcontext', 'source', 'devicefamily',
+                'WPPCLdoC', 'OptanonConsent', 'OptanonAlertBoxClosed',
+                's_ecid', 'AMCV_'
+            ]
+            
+            filtered = []
+            for cookie in cookies_list:
+                if not isinstance(cookie, dict):
+                    continue
+                
+                name = cookie.get('name', '')
+                # Only include cookies for .fandango.com domain
+                domain = cookie.get('domain', '')
+                
+                if any(pattern in name for pattern in essential_patterns):
+                    # Check if it's a fandango cookie
+                    if 'fandango.com' in domain or domain == 'www.fandango.com':
+                        filtered.append(cookie)
+            
             cookie_header = None
-            if cookies_list:
-                try:
-                    cookie_header = "; ".join(f"{c.get('name')}={c.get('value')}" for c in cookies_list if c.get('name'))
-                except Exception:
-                    cookie_header = None
-
-            if not cookie_header and captured_set_cookie:
-                # Parse simple name=value pairs from Set-Cookie strings
-                pairs = []
-                for sc in captured_set_cookie:
-                    try:
-                        first = sc.split(';', 1)[0].strip()
-                        if '=' in first:
-                            pairs.append(first)
-                    except Exception:
-                        continue
-                if pairs:
-                    cookie_header = "; ".join(pairs)
-
-            return cookie_header, cookies_list, captured_set_cookie, captured_requests
-
+            if filtered:
+                cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in filtered)
+                logger.info(f"Using {len(filtered)} essential cookies out of {len(cookies_list)} total")
+                logger.info(f"Cookie names: {[c['name'] for c in filtered]}")
+                logger.info(f"Cookie header length: {len(cookie_header)} bytes")
+            else:
+                logger.warning("No essential cookies found after filtering")
+            
+            # Convert to dict for backward compatibility
+            cookies_dict = {c['name']: c['value'] for c in cookies_list if isinstance(c, dict) and c.get('name')}
+            
+            return cookie_header, cookies_dict
+            
         except Exception:
             logger.exception("Dynamic cookie capture failed for %s", theater_url)
-            return None, [], [], []
+            return None, {}
 
     def main(self):
         try:
             # 1. Get Cities
-            # city_page = self.fetch_page(urljoin(self.base_url, "movietimes"))
+            # city_page = self.fetch_page(urljoin(self.base_url, "showtimes"))
             # self.get_cities(city_page)
             
             # 2. Read Cities back
@@ -583,16 +567,17 @@ class Scraper:
 
             # 4. Parse and Save Theaters
             # self.get_theaters(theater_pages)
-            theaters = self.read_from_db("SELECT * FROM theaters WHERE name <> 'Select Theater'")
-            print(theaters[0:2])
+            # theaters = self.read_from_db("SELECT * FROM theaters WHERE name <> 'Select Theater'")
+            # print(theaters[0:2])
 
-            # 5. Fetch movietimes
-            movietimes_pages = asyncio.run(self.fetch_pages(targets=theaters[0:2], mode='movietimes'))
-            print(movietimes_pages[0][1])
+            # 5. Fetch showtimes
+            # If you have a working curl, prefer passing --cookie or --headers-file to avoid DynamicFetcher capture.
+            # showtimes_pages = asyncio.run(self.fetch_pages(targets=theaters[0:2], mode='showtimes'))
 
-            # 6. Parse and Save Movietimes
-            # self.get_movietimes(movietimes_pages[0:2])
-            # movietimes = self.read_from_db("SELECT * FROM movietimes")
+            # 6. Parse and Save showtimes
+            # self.get_showtimes(showtimes_pages[0:2])
+            showtimes = self.read_from_db("SELECT * FROM showtimes")
+            print(showtimes[0:20])
 
         except Exception as exc:
             logger.exception("Main loop failed")
