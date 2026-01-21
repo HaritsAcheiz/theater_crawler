@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 import sqlite3
 from pathlib import Path
 import hashlib
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -88,7 +89,7 @@ class Scraper:
             schemas = {
                 'cities': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, source TEXT, name TEXT, url TEXT)",
                 'theaters': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, source TEXT, city_code TEXT, name TEXT, url TEXT)",
-                'movietimes': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, theater_code TEXT, date date, time time, name TEXT, showtime_id TEXT)",
+                'movietimes': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, source TEXT, theater_code TEXT, date_part date, time_part time, name TEXT, movie_id TEXT, theater_id TEXT, rating TEXT, url TEXT)",
                 'seats': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, movietimes_code TEXT, name TEXT, url TEXT)"
             }
             
@@ -99,7 +100,7 @@ class Scraper:
             columns = {
                 'cities': "code, source, name, url",
                 'theaters': "code, source, city_code, name, url",
-                'movietimes': "code, theater_code, date, time, name, showtime_id",
+                'movietimes': "code, source, theater_code, date_part, time_part, name, movie_id, theater_id, rating, url",
                 'seats': "name, url" # Note: your original logic for seats had only 2 columns in VALUES
             }
             
@@ -112,31 +113,57 @@ class Scraper:
             logger.error(f"Database Error on {table_name}: {e}")
             raise
     
-    async def fetch_pages(self, targets):
+    async def fetch_pages(self, targets, mode='theaters'):
         fetcher = AsyncFetcher()
         fetcher.adaptive = True
         
         logger.info(f"Starting async fetch for {len(targets)} pages...")
         
         try:
-            # Safer indexing: assumes URL is the last element
-            urls = [target[-1] for target in targets]
+            # Build urls and a parallel references list so each response can be mapped
+            # back to its originating target (e.g. theater_code). urls_len may differ
+            # from len(targets) when mode='movietimes' because we generate multiple
+            # dates per theater.
+            urls = []
+            references = []
+
+            if mode == 'theaters':
+                for target in targets:
+                    urls.append(target[-1])
+                    # use index 1 as the canonical code (matches your DB schema)
+                    references.append(target[1])
+
+            elif mode == 'movietimes':
+                current_date = datetime.now()
+                for target in targets:
+                    theater_code = target[1]
+                    base = target[-1]
+                    for i in range(7):
+                        date = current_date + timedelta(days=i)
+                        urls.append(urljoin(base, f"?format=all&date={date.strftime('%Y-%m-%d')}"))
+                        # repeat the theater_code for each generated URL
+                        references.append(theater_code)
+
+            else:
+                raise ValueError(f"Unknown mode specified for fetch_pages: {mode}")
+
             tasks = [fetcher.get(url) for url in urls]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
 
             results = []
             success_count = 0
             for i, response in enumerate(responses):
+                # Map response at index i back to the reference at index i
+                ref = references[i] if i < len(references) else None
+
                 if isinstance(response, Exception):
-                    logger.warning(f"Request failed for {urls[i]}: {response}")
+                    logger.warning(f"Request failed for {urls[i]} (ref={ref}): {response}")
                     continue
-                
+
                 success_count += 1
-                # target[1] is the city code from your DB structure
-                city_code = targets[i][1]
-                results.append((city_code, response)) 
-            
-            logger.info(f"Fetch complete. Success: {success_count}/{len(targets)}")
+                results.append((ref, response))
+
+            logger.info(f"Fetch complete. Success: {success_count}/{len(urls)} requests")
             return results
 
         except Exception as e:
@@ -209,35 +236,41 @@ class Scraper:
         try:
             movietimes = []
 
+            print(page_contents[0][1])
             for theater_code, response in page_contents:
-                print(theater_code, response)
-            #     if response is None or isinstance(response, Exception):
-            #         continue
+                if response is None or isinstance(response, Exception):
+                    continue
+                
 
-            #     selector = response if hasattr(response, "css") else Selector(response.body)
-            #     showtime_elements = selector.css("div.showtimes-list > div.showtime-item")
+                selector = response if hasattr(response, "css") else Selector(response.body)
+                showtime_elements = selector.css("li.shared-movie-showtimes")
+                # print(len(showtime_elements))
 
-            #     if not showtime_elements:
-            #         logger.debug(f"No showtimes found for theater_code: {theater_code}")
-            #         continue
+                if not showtime_elements:
+                    logger.debug(f"No showtimes found for theater_code: {theater_code}")
+                    continue
 
-            #     for showtime in showtime_elements:
-            #         name_elem = showtime.css_first("div.movie-title")
-            #         time_elem = showtime.css_first("span.showtime")
-            #         date_elem = showtime.css_first("span.showdate")
-            #         showtime_id = showtime.attrib.get("data-showtime-id", "")
+                for showtime in showtime_elements:
+                    name_elem = showtime.css_first("a.shared-movie-showtimes__movie-title-link")
+                    rating_elem = showtime.css_first("data.shared-showtimes__movie-rating")
+                    schedule_elems = showtime.css("showtimes-btn-list__item > a")
+                    for sched in schedule_elems:
+                        code = hashlib.md5(url.encode()).hexdigest()
+                        source = response.url
+                        url = sched.attrib.get("href", "")
+                        # url = 'https://tickets.fandango.com/transaction/ticketing/mobile/jump.aspx?sdate=2026-01-21%2B12%3A00&from=mov_det_showtimes&source=desktop&mid=2040&tid=AAYAH&dfam=webbrowser&showtimehashcode=v2-e8be2d0ea039ad92bcc49cd16144d2dd968ba5d87205ad2fefd848870637d4dc'
+                        sdate = url.split("sdate=")[-1].split("&")[0]
+                        date_part = sdate.split("+")[0]
+                        time_part = sdate.split("+")[-1].replace("%3A", ":")
+                        movie_id = url.split("mid=")[-1].split("&")[0]
+                        theater_id = url.split("tid=")[-1].split("&")[0]
+                        name = name_elem.text.strip() if name_elem else ""
+                        rating = rating_elem.attrib.get("value", "") if rating_elem else ""
+                        movietimes.append((code, source, theater_code, date_part, time_part, name, movie_id, theater_id, rating, url))
 
-            #         if name_elem and time_elem and date_elem and showtime_id:
-            #             name = name_elem.text.strip()
-            #             time = time_elem.text.strip()
-            #             date = date_elem.text.strip()
-            #             code = hashlib.md5((theater_code + showtime_id).encode()).hexdigest()
-
-            #             movietimes.append((code, theater_code, date, time, name, showtime_id))
-
-            # logger.info(f"Parsed {len(movietimes)} total movietimes from all pages.")
-            # if movietimes:
-            #     self.save_to_db(movietimes, table_name="movietimes")
+            logger.info(f"Parsed {len(movietimes)} total movietimes from all pages.")
+            if movietimes:
+                self.save_to_db(movietimes, table_name="movietimes")
             
         except Exception as e:
             logger.error(f"Error in get_movietimes: {e}")
@@ -314,14 +347,15 @@ class Scraper:
 
             # 4. Parse and Save Theaters
             # self.get_theaters(theater_pages)
-            theaters = self.read_from_db("SELECT * FROM theaters")
+            theaters = self.read_from_db("SELECT * FROM theaters WHERE name <> 'Select Theater'")
+            print(theaters[0:3])
 
             # 5. Fetch movietimes
-            movietimes_pages = asyncio.run(self.fetch_pages(targets=theaters[0:2]))
-            self.write_response_to_file(movietimes_pages[0][1], filename="movietimes.html", out_dir=".")
+            movietimes_pages = asyncio.run(self.fetch_pages(targets=theaters[0:2], mode='movietimes'))
+            # self.write_response_to_file(movietimes_pages[0][1], filename="movietimes.html", out_dir=".")
             
             # 6. Parse and Save Movietimes
-            # self.get_movietimes(movietimes_pages)
+            self.get_movietimes(movietimes_pages[0:2])
             # movietimes = self.read_from_db("SELECT * FROM movietimes")
 
         except Exception as exc:
