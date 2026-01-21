@@ -5,5 +5,9 @@
 2. uv venv
 3. uv add -r requirements.txt
 
+## Install playwright
+source .venv/bin/activate
+playwright install 
+
 ## Usage
 uv run main.py
