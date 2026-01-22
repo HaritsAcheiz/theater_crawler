@@ -6,6 +6,7 @@ import requests
 import logging
 from dotenv import load_dotenv
 import os
+import csv
 from dataclasses import dataclass
 import time
 from urllib.parse import urljoin
@@ -13,6 +14,7 @@ import sqlite3
 from pathlib import Path
 import hashlib
 from datetime import datetime, timedelta
+import re
 
 load_dotenv()
 
@@ -112,17 +114,35 @@ class Scraper:
             
             # Mapping for table schemas
             schemas = {
-                'cities': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, source TEXT, name TEXT, url TEXT)",
-                'theaters': "(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, source TEXT, city_code TEXT, name TEXT, theater_id TEXT, url TEXT)",
+                'cities': """(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT UNIQUE,
+                    source TEXT,
+                    name TEXT,
+                    url TEXT
+                )""",
+                'theaters': """(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT UNIQUE,
+                    source TEXT,
+                    city_code TEXT,
+                    name TEXT,
+                    theater_id TEXT,
+                    url TEXT
+                )""",
                 'showtimes': """(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, 
                     code TEXT UNIQUE, 
                     source TEXT, 
                     theater_code TEXT, 
-                    theater_id TEXT, 
+                    theater_id TEXT,
+                    theater_address TEXT,
+                    theater_long REAL,
+                    theater_lat REAL,
                     ticketing_date TEXT, 
                     movie_id TEXT, 
-                    movie_title TEXT, 
+                    movie_title TEXT,
+                    movie_format TEXT, 
                     runtime INT, 
                     release_date TEXT, 
                     rating TEXT, 
@@ -131,22 +151,22 @@ class Scraper:
                     showtime_id TEXT, 
                     url TEXT
                 )""",
-                'seat_maps': """(
+                'seats': """(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     code TEXT UNIQUE,
                     showtime_id TEXT,
-                    theater_id TEXT,
-                    theater_name TEXT,
-                    chain_code TEXT,
-                    auditorium_id TEXT,
-                    total_seats INTEGER,
-                    available_seats INTEGER,
-                    seats_data TEXT,
-                    areas_data TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    max_tickets INTEGER,
+                    max_reserved_tickets INTEGER,
+                    area_id TEXT,
+                    area_name TEXT,
+                    ticket_description TEXT,
+                    ticket_price REAL,
+                    ticket_service_fee REAL,
+                    ticket_type_id TEXT,
+                    admissions_per_ticket INTEGER
                 )"""
             }
-            
+
             # Create table if not exists
             cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} {schemas[table_name]}")
             
@@ -157,8 +177,8 @@ class Scraper:
             columns = {
                 'cities': "code, source, name, url",
                 'theaters': "code, source, city_code, name, theater_id, url",
-                'showtimes': "code, source, theater_code, theater_id, ticketing_date, movie_id, movie_title, runtime, release_date, rating, poster_url, genres, showtime_id, url",
-                'seat_maps': "code, showtime_id, theater_id, theater_name, chain_code, auditorium_id, total_seats, available_seats, seats_data, areas_data"
+                'showtimes': "code, source, theater_code, theater_id, theater_address, theater_long, theater_lat, ticketing_date, movie_id, movie_title, movie_format, runtime, release_date, rating, poster_url, genres, showtime_id, url",
+                'seats': "code, showtime_id, max_tickets, max_reserved_tickets, area_id, area_name, ticket_description, ticket_price, ticket_service_fee, ticket_type_id, admissions_per_ticket"
             }
             
             # Insert data
@@ -169,18 +189,6 @@ class Scraper:
             
             conn.commit()
             logger.info(f"Successfully saved {cursor.rowcount} rows to {table_name}")
-            
-            # Log some stats for seat_maps
-            if table_name == 'seat_maps' and cursor.rowcount > 0:
-                cursor.execute("""
-                    SELECT 
-                        COUNT(*) as total,
-                        SUM(total_seats) as total_capacity,
-                        SUM(available_seats) as total_available
-                    FROM seat_maps
-                """)
-                stats = cursor.fetchone()
-                logger.info(f"Seat map stats - Total records: {stats[0]}, Total capacity: {stats[1]}, Available: {stats[2]}")
             
             conn.close()
             
@@ -245,35 +253,40 @@ class Scraper:
                         logger.exception("Failed to capture cookies")
             
             elif mode == 'seats':
-                import time
-                timestamp = int(time.time() * 1000)
+                for target in targets:
+                    print(50 * '=')
+                    print(target)
+                    urls.append(target[-1])
+                    references.append(target[0])
+            #     timestamp = int(time.time() * 1000) # need to find out
+
+            #     for *_, showtime_id, theater_url in targets:
+            #         print(showtime_id, theater_url)
+            #         url = f"https://tickets.fandango.com/checkoutapi/showtimes/v2/{showtime_id}/seat-map?_={timestamp}"
+            #         urls.append(url)
+            #         references.append(showtime_id)
+            #         timestamp += 1 # need to findout
                 
-                for showtime_id, theater_url in targets:
-                    url = f"https://tickets.fandango.com/checkoutapi/showtimes/v2/{showtime_id}/seat-map?_={timestamp}"
-                    urls.append(url)
-                    references.append(showtime_id)
-                    timestamp += 1
-                
-                # Capture cookies and auth token for seat maps
-                if targets:
-                    try:
-                        representative_url = targets[0][1]  # theater_url from first target
-                        logger.info(f"Capturing cookies and auth from {representative_url}")
+            #     # Capture cookies and auth token for seat maps
+            #     if targets:
+            #         try:
+            #             representative_url = targets[0][-1]
+            #             logger.info(f"Capturing cookies and auth from {representative_url}")
                         
-                        cookie_header, cookies_dict, auth_token, session_id, extra_headers = await asyncio.to_thread(
-                            self.capture_cookies_and_auth,
-                            representative_url
-                        )
+            #             cookie_header, cookies_dict, auth_token, session_id, extra_headers = await asyncio.to_thread(
+            #                 self.capture_cookies_and_auth,
+            #                 representative_url
+            #             )
                         
-                        if not cookie_header:
-                            logger.warning("No cookies captured")
-                        if not auth_token:
-                            logger.warning("No auth token captured - seat map requests will likely fail")
-                    except Exception:
-                        logger.exception("Failed to capture cookies/auth for seat maps")
+            #             if not cookie_header:
+            #                 logger.warning("No cookies captured")
+            #             if not auth_token:
+            #                 logger.warning("No auth token captured - seat map requests will likely fail")
+            #         except Exception:
+            #             logger.exception("Failed to capture cookies/auth for seat maps")
             
-            else:
-                raise ValueError(f"Unknown mode: {mode}")
+            # else:
+            #     raise ValueError(f"Unknown mode: {mode}")
             
             # Set headers based on mode
             headers = {}
@@ -289,26 +302,26 @@ class Scraper:
                 if cookie_header:
                     headers['Cookie'] = cookie_header
                     
-            elif mode == 'seats':
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0',
-                    'Accept': 'application/json, text/javascript, */*; q=0.01',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Content-Type': 'application/json',
-                    'Referer': 'https://tickets.fandango.com/mobileexpress/seatselection',
-                    'Sec-Fetch-Dest': 'empty',
-                    'Sec-Fetch-Mode': 'cors',
-                    'Sec-Fetch-Site': 'same-origin',
-                }
-                if cookie_header:
-                    headers['Cookie'] = cookie_header
-                if auth_token:
-                    headers['Authorization'] = auth_token
-                if session_id:
-                    headers['X-FD-SessionId'] = session_id
-                # Add any extra anti-bot headers
-                if extra_headers:
-                    headers.update(extra_headers)
+            # elif mode == 'seats':
+            #     headers = {
+            #         'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0',
+            #         'Accept': 'application/json, text/javascript, */*; q=0.01',
+            #         'Accept-Language': 'en-US,en;q=0.5',
+            #         'Content-Type': 'application/json',
+            #         'Referer': 'https://tickets.fandango.com/mobileexpress/seatselection',
+            #         'Sec-Fetch-Dest': 'empty',
+            #         'Sec-Fetch-Mode': 'cors',
+            #         'Sec-Fetch-Site': 'same-origin',
+            #     }
+            #     if cookie_header:
+            #         headers['Cookie'] = cookie_header
+            #     if auth_token:
+            #         headers['Authorization'] = auth_token
+            #     if session_id:
+            #         headers['X-FD-SessionId'] = session_id
+            #     # Add any extra anti-bot headers
+            #     if extra_headers:
+            #         headers.update(extra_headers)
             
             # Define a semaphore-controlled fetch function
             async def fetch_with_semaphore(url, headers_dict):
@@ -345,23 +358,23 @@ class Scraper:
                         content = page.text if hasattr(page, 'text') else str(page)
                         
                         # For seats mode, expect pure JSON
-                        if mode == 'seats':
-                            try:
-                                json_data = json.loads(content)
-                                logger.info(f"Successfully fetched seat map for {ref}")
-                                results.append((ref, json_data))
-                            except json.JSONDecodeError as e:
-                                logger.error(f"JSON decode error for {ref}: {e}")
-                                # Save error response for debugging
-                                self.write_response_to_file(
-                                    content,
-                                    filename=f"seat_error_{ref}.json",
-                                    out_dir="out/errors"
-                                )
-                                results.append((ref, None))
+                        # if mode == 'seats':
+                        #     try:
+                        #         json_data = json.loads(content)
+                        #         logger.info(f"Successfully fetched seat map for {ref}")
+                        #         results.append((ref, json_data))
+                        #     except json.JSONDecodeError as e:
+                        #         logger.error(f"JSON decode error for {ref}: {e}")
+                        #         # Save error response for debugging
+                        #         self.write_response_to_file(
+                        #             content,
+                        #             filename=f"seat_error_{ref}.json",
+                        #             out_dir="out/errors"
+                        #         )
+                        #         results.append((ref, None))
                         
                         # For movietimes, extract JSON from HTML wrapper
-                        elif mode == 'movietimes':
+                        if mode == 'movietimes':
                             selector = page if hasattr(page, "css") else Selector(content)
                             body_element = selector.css("body").get()
                             
@@ -470,6 +483,8 @@ class Scraper:
         try:
             showtimes = []
             
+
+
             for theater_code, response in page_contents:
                 if response is None or isinstance(response, Exception):
                     logger.warning(f"No data for theater_code: {theater_code}")
@@ -478,8 +493,14 @@ class Scraper:
                     # Navigate the JSON structure
                     view_model = response.get('viewModel', {})
                     theater_info = view_model.get('theater', {})
-                    theater_id = theater_info.get('id', '')
+                    theater_details = theater_info.get('details', '')
+                    theater_id = theater_details.get('id', '')
+                    theater_address = theater_details.get('fullAddress', '')
+                    theater_geo = theater_details.get('geo', '')
+                    theater_long = theater_geo.get('longitude', None)
+                    theater_lat = theater_geo.get('latitude', None)
                     
+
                     # Get movies list
                     movies = view_model.get('movies', [])
                     
@@ -523,27 +544,6 @@ class Scraper:
                                 # Get showtimes for this amenity group
                                 showtimes_data = amenity_group.get('showtimes', [])
                                 
-                                if not showtimes_data:
-                                    # Record movie without showtimes
-                                    code = hashlib.md5(f"{theater_code}_{movie_id}".encode()).hexdigest()
-                                    showtimes.append((
-                                        code,
-                                        'fandango',  # source
-                                        theater_code,
-                                        theater_id,
-                                        None,  # ticketing_date
-                                        movie_id,
-                                        movie_title,
-                                        runtime,
-                                        release_date,
-                                        rating,
-                                        poster_url,
-                                        genres,
-                                        None,  # showtime_id
-                                        None   # url
-                                    ))
-                                    continue
-                                
                                 for showtime in showtimes_data:
                                     showtime_id = showtime.get('id', '')
                                     ticketing_date = showtime.get('ticketingDate', '')
@@ -551,7 +551,7 @@ class Scraper:
                                     
                                     # Create unique code for this showtime
                                     code = hashlib.md5(
-                                        f"{theater_code}_{movie_id}_{showtime_id}".encode()
+                                        f"{theater_code}|{movie_id}|{showtime_id}".encode()
                                     ).hexdigest()
                                     
                                     # Build full URL if relative
@@ -562,6 +562,9 @@ class Scraper:
                                         'fandango',
                                         theater_code,
                                         theater_id,
+                                        theater_address,
+                                        theater_long,
+                                        theater_lat,
                                         ticketing_date,
                                         movie_id,
                                         movie_title,
@@ -708,7 +711,6 @@ class Scraper:
             )
             
             # Wait for any additional requests
-            import time
             time.sleep(3)
             
             # Try to trigger seat map load if not already loaded
@@ -777,101 +779,290 @@ class Scraper:
             logger.exception(f"Failed to capture cookies and auth from {ticketing_url}")
             return None, {}, None, None, {}
 
-    def get_seats(self, seat_map_data):
-        """Parse seat map data to extract seat availability."""
+    def _extract_json_object(self, text: str, start_pos: int):
+        """
+        Extract a complete JSON object by counting braces
+        """
+        if start_pos >= len(text) or text[start_pos] != '{':
+            return None
+        
+        brace_count = 0
+        in_string = False
+        escape_next = False
+        
+        for i in range(start_pos, len(text)):
+            char = text[i]
+            
+            # Handle escape sequences
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\':
+                escape_next = True
+                continue
+            
+            # Handle strings (to ignore braces inside strings)
+            if char == '"':
+                in_string = not in_string
+                continue
+            
+            # Only count braces outside of strings
+            if not in_string:
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    
+                    # Found the closing brace
+                    if brace_count == 0:
+                        return text[start_pos:i+1]
+                elif char == ';' and brace_count == 0:
+                    # Reached end of statement
+                    return None
+        
+        return None
+
+    def parse_script_variable(self, page, variable_name: str):
+        """
+        Extract and parse a JavaScript variable from script tags
+        Args:
+            variable_name: Name of the JavaScript variable (e.g., 'window.Commerce.models')
+        Returns:
+            Parsed JSON data or None if not found
+        """
+        try:
+            # Get all script tags
+            scripts = page.css('script')
+            
+            # Escape special regex characters
+            escaped_name = re.escape(variable_name)
+            
+            for script in scripts:
+                script_text = script.text
+                if not script_text:
+                    continue
+                
+                # Check if variable exists in this script
+                if variable_name not in script_text:
+                    continue
+                
+                # Find the variable assignment
+                pattern = rf'{escaped_name}\s*=\s*'
+                match = re.search(pattern, script_text)
+                
+                if not match:
+                    continue
+                
+                # Start position after the '=' sign
+                start_pos = match.end()
+                
+                # Extract the complete JSON object
+                json_str = self._extract_json_object(script_text, start_pos)
+                
+                if json_str:
+                    return json.loads(json_str)
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error parsing {variable_name}: {e}")
+            return None
+
+    def get_commerce_models(self, page):
+        """Extract window.Commerce.models data"""
+        return self.parse_script_variable(page, 'window.Commerce.models')
+
+    def get_ticket_info(self, page):
+        """Extract ticket information"""
+        commerce = self.get_commerce_models(page)
+        if not commerce or 'tickets' not in commerce:
+            return None
+        
+        tickets = commerce['tickets']
+        return {
+            'max_tickets': tickets.get('maxTickets'),
+            'max_reserved_tickets': tickets.get('maxReservedTickets'),
+            'seating_areas': tickets.get('seatingAreas', []),
+            'selected_area_id': tickets.get('selectedSeatingAreaId'),
+            'selected_tickets': tickets.get('selectedTickets', [])
+        }
+
+    def get_seats(self, seat_pages):
         try:
             seat_records = []
             
-            for showtime_id, json_data in seat_map_data:
-                if json_data is None or isinstance(json_data, Exception):
-                    logger.warning(f"No seat map data for showtime_id: {showtime_id}")
-                    continue
-                
-                try:
-                    data = json_data.get('data', {})
-                    
-                    # Extract metadata
-                    theater_id = data.get('theaterId', '')
-                    theater_name = data.get('theaterName', '')
-                    chain_code = data.get('chainCode', '')
-                    auditorium_id = data.get('auditoriumId', '')
-                    total_seats = data.get('totalSeatCount', 0)
-                    available_seats = data.get('totalAvailableSeatCount', 0)
-                    
-                    # Extract seat details
-                    seats = data.get('seats', [])
-                    areas = data.get('areas', [])
-                    
-                    # Create unique code
-                    code = hashlib.md5(showtime_id.encode()).hexdigest()
-                    
+            for showtime_id, page in seat_pages:
+                ticket_info = self.get_ticket_info(page)
+                if ticket_info:
+                    seating_areas = ticket_info.get('seating_areas', [])
+                    for area in seating_areas:
+                        ticket_types = area.get('ticketTypes', [])
+                        for ttype in ticket_types:
+                            data = {}
+                            data['code'] = hashlib.md5(f"{showtime_id}|{area.get('areaId')}|{ttype.get('ticketTypeId')}".encode()).hexdigest()
+                            data['showtime_id'] = showtime_id
+                            data['max_tickets'] = ticket_info.get('max_tickets', 0)
+                            data['max_reserved_tickets'] = ticket_info.get('max_reserved_tickets', 0)
+                            data['area_id'] = area.get('areaId', None)
+                            data['area_name'] = area.get('areaName', None)
+                            data['ticket_description'] = ttype.get('description', None)
+                            data['ticket_price'] = ttype.get('price', None)
+                            data['service_fee'] = ttype.get('serviceFee', None)
+                            data['ticket_type_id'] = ttype.get('ticketTypeId', None)
+                            data['admissions_per_ticket'] = ttype.get('admissionsPerTicket', None)
+                            seat_records.append((
+                                data['code'],
+                                data['showtime_id'],
+                                data['max_tickets'],
+                                data['max_reserved_tickets'],
+                                data['area_id'],
+                                data['area_name'],
+                                data['ticket_description'],
+                                data['ticket_price'],
+                                data['service_fee'],
+                                data['ticket_type_id'],
+                                data['admissions_per_ticket']
+                            ))
+                else:
                     seat_records.append((
-                        code,
-                        showtime_id,
-                        theater_id,
-                        theater_name,
-                        chain_code,
-                        str(auditorium_id),
-                        total_seats,
-                        available_seats,
-                        json.dumps(seats),  # Store full seat layout
-                        json.dumps(areas),  # Store area/pricing info
-                    ))
-                    
-                except Exception as e:
-                    logger.error(f"Error parsing seat map for {showtime_id}: {e}")
-                    continue
-            
+                                '',
+                                '',
+                                0,
+                                0,
+                                '',
+                                '',
+                                '',
+                                0.0,
+                                0.0,
+                                '',
+                                0
+                            ))
             logger.info(f"Parsed {len(seat_records)} seat maps.")
-            
             if seat_records:
-                self.save_to_db(seat_records, table_name="seat_maps")
+                self.save_to_db(seat_records, table_name="seats")
                 
         except Exception as e:
             logger.error(f"Error in parse_seat_maps: {e}")
             raise
 
+    def export_showtimes_csv(self, csv_path='out/showtimes.csv', db_path='theaters.db'):
+        """Export showtimes joined with theater/city and seat capacity stats.
 
-    # def main(self):
-    #     try:
-    #         # 1. Get Cities
-    #         city_page = self.fetch_page(urljoin(self.base_url, "movietimes"))
-    #         self.get_cities(city_page)
-            
-    #         # 2. Read Cities back
-    #         cities = self.read_from_db("SELECT * FROM cities")
-    #         if not cities:
-    #             logger.error("No cities found in DB. Stopping.")
-    #             return
+        Produces a CSV at showtime granularity with additional columns:
+          - capacity_seats: SUM(max_tickets * admissions_per_ticket)
+          - reserved_seats: SUM(max_reserved_tickets * admissions_per_ticket)
+          - available_seats: capacity_seats - reserved_seats
 
-    #         # 3. Fetch Theaters Async
-    #         theater_pages = asyncio.run(self.fetch_pages(targets=cities[0:2]))
+        Uses the `seats` table aggregates where available.
+        """
+        try:
+            Path(os.path.dirname(csv_path) or '.').mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
 
-    #         # 4. Parse and Save Theaters
-    #         self.get_theaters(theater_pages)
-    #         theaters = self.read_from_db("SELECT * FROM theaters WHERE name <> 'Select Theater'")
+            query = """
+            SELECT
+                sh.ticketing_date,
+                sh.showtime_id,
+                sh.movie_id,
+                sh.movie_title,
+                sh.runtime,
+                sh.release_date,
+                sh.rating,
+                sh.poster_url,
+                sh.genres,
+                sh.url AS showtime_url,
+                sh.theater_code,
+                th.name AS theater_name,
+                th.theater_id AS theater_tid,
+                sh.theater_address,
+                sh.theater_lat,
+                sh.theater_long,
+                c.name AS city_name,
+                sa.seat_areas,
+                sa.min_price,
+                sa.max_price,
+                sa.avg_price,
+                sa.capacity_seats,
+                sa.reserved_seats
+            FROM showtimes sh
+            LEFT JOIN theaters th ON sh.theater_code = th.code
+            LEFT JOIN cities c ON th.city_code = c.code
+            LEFT JOIN (
+                SELECT showtime_id,
+                       COUNT(*) AS seat_areas,
+                       MIN(ticket_price) AS min_price,
+                       MAX(ticket_price) AS max_price,
+                       AVG(ticket_price) AS avg_price,
+                       SUM(COALESCE(max_tickets,0) * COALESCE(admissions_per_ticket,1)) AS capacity_seats,
+                       SUM(COALESCE(max_reserved_tickets,0) * COALESCE(admissions_per_ticket,1)) AS reserved_seats
+                FROM seats
+                GROUP BY showtime_id
+            ) sa ON sh.showtime_id = sa.showtime_id
+            ORDER BY sh.ticketing_date ASC
+            """
 
-    #         # 5. Fetch showtimes
-    #         showtimes_pages = asyncio.run(self.fetch_pages(targets=theaters[0:2], mode='movietimes'))
-    #         self.write_response_to_file(showtimes_pages[0][1], filename="showtimes_page_example.html")
+            cur.execute(query)
+            rows = cur.fetchall()
 
-    #         # 6. Parse and Save showtimes
-    #         self.get_showtimes(showtimes_pages[0:2])
-    #         showtimes = self.read_from_db("SELECT * FROM showtimes")
-    #         print(showtimes[0:5])
+            if not rows:
+                logger.warning("No showtime rows found to export")
+                conn.close()
+                return None
 
-            
-    #         # 7. Fetch seats
-    #         # seats_pages = asyncio.run(self.fetch_pages(targets=showtimes[19:21], mode='seats'))
-    #         # self.write_response_to_file(seats_pages[0][1], filename="seat_page_example.html")
+            # Build header from cursor description and append capacity/available fields
+            headers = [d[0] for d in cur.description]
+            extra = []
+            if 'capacity_seats' not in headers:
+                extra.append('capacity_seats')
+            if 'reserved_seats' not in headers:
+                extra.append('reserved_seats')
+            # always include available_seats
+            extra.append('available_seats')
+            headers_out = headers + extra
 
-    #         # 8. Parse and Save seats
-    #         # self.get_seats(seats_pages[0:2])
-    #         # seat_map_results = await scraper.fetch_seat_maps_from_showtimes(showtimes)
+            with open(csv_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(headers_out)
+                for r in rows:
+                    out = []
+                    for h in headers:
+                        v = r[h]
+                        if isinstance(v, float):
+                            out.append(round(v, 4))
+                        else:
+                            out.append(v)
 
+                    capacity = r['capacity_seats'] if 'capacity_seats' in r.keys() and r['capacity_seats'] is not None else 0
+                    reserved = r['reserved_seats'] if 'reserved_seats' in r.keys() and r['reserved_seats'] is not None else 0
+                    try:
+                        available = int(capacity) - int(reserved)
+                    except Exception:
+                        available = None
 
-    #     except Exception as exc:
-    #         logger.exception("Main loop failed")
+                    # Append only the extra columns that are not already in headers
+                    append_values = []
+                    for col in extra:
+                        if col == 'capacity_seats':
+                            append_values.append(capacity)
+                        elif col == 'reserved_seats':
+                            append_values.append(reserved)
+                        elif col == 'available_seats':
+                            append_values.append(available)
+                    out.extend(append_values)
+                    writer.writerow(out)
+
+            conn.close()
+            logger.info("Exported %d showtime rows to %s", len(rows), csv_path)
+            return csv_path
+
+        except Exception:
+            logger.exception("Failed to export showtimes to CSV")
+            raise
+
+    
 
     def main(self):
         try:
@@ -896,32 +1087,24 @@ class Scraper:
 
             # 5. Fetch showtimes (limit to 10 concurrent to avoid overwhelming the server)
             showtimes_pages = asyncio.run(
-                self.fetch_pages(targets=theaters[0:1], mode='movietimes', max_concurrent=10)
+                self.fetch_pages(targets=theaters, mode='movietimes', max_concurrent=10)
             )
             self.write_response_to_file(showtimes_pages[0][1], filename="showtimes_page_example.html")
 
             # 6. Parse and Save showtimes
-            self.get_showtimes(showtimes_pages[0:1])
+            self.get_showtimes(showtimes_pages)
             showtimes = self.read_from_db("SELECT * FROM showtimes WHERE showtime_id IS NOT NULL")
-
-
-            # 7. Prepare seat map targets
-            # showtimes_for_seats = [
-            #     (showtime[13], showtime[14])  # (showtime_id, url)
-            #     for showtime in showtimes[0:20]
-            #     if showtime[13] and showtime[14]
-            # ]
             
             # 8. Fetch seats (very conservative rate limit)
-            # seats_pages = asyncio.run(
-            #     self.fetch_pages(targets=showtimes_for_seats, mode='seats', max_concurrent=3)
-            # )
-            
-            # if seats_pages and seats_pages[0][1]:
-            #     self.write_response_to_file(seats_pages[0][1], filename="seat_page_example.json")
+            showtimes_targets = [(t[-2], t[-1]) for t in showtimes]
+
+            seat_pages = asyncio.run(
+                self.fetch_pages(targets=showtimes_targets, mode='seats', max_concurrent=10)
+            )
 
             # 9. Parse and Save seats
-            # self.get_seats(seats_pages)
+            self.get_seats(seat_pages)
+            seats = self.read_from_db("SELECT * FROM seats")
 
             print('Cities:')
             print(len(cities))
@@ -935,6 +1118,9 @@ class Scraper:
             print(len(showtimes))
             print(showtimes[0])
 
+            print('Seats:')
+            print(len(seats))
+            print(seats[0])
 
         except Exception as exc:
             logger.exception("Main loop failed")
@@ -943,3 +1129,4 @@ class Scraper:
 if __name__ == "__main__":
     scraper = Scraper()
     scraper.main()
+    scraper.export_showtimes_csv(csv_path='out/showtimes_with_seats.csv', db_path='theaters.db')
