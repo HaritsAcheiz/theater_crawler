@@ -7,4 +7,5 @@ uv.lock
 *.html
 *.json
 *.db
-*.txt
+notes.txt
+out/
